@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL Raymarch 地形（不透明水面+反射折射）</title>
+    <style>
+        body { margin: 0; cursor: grab; }
+        canvas { display: block; }
+        body:active { cursor: grabbing; }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas" width="1280" height="720" style="width:1280px;height:720px;"></canvas>
+
+    <script>
+        const canvas = document.getElementById('glCanvas');
+        const gl = canvas.getContext('webgl');
+        if (!gl) {
+            alert('你的浏览器不支持WebGL，请更换浏览器重试');
+            throw new Error('WebGL not supported');
+        }
+
+        // 顶点着色器
+        const vertexShaderSource = `
+            attribute vec2 a_position;
+            varying vec2 v_uv;
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+                v_uv = (a_position + 1.0) / 2.0;
+            }
+        `;
+
+        // ===================== 片元着色器（调整水面透明度）=====================
+        const fragmentShaderSource = `
+            precision mediump float;
+            varying vec2 v_uv;
+            uniform vec2 u_resolution;
+            uniform vec2 u_angle;          
+            uniform float u_cameraDist;    
+
+            // 全局常量（调整水下衰减系数：从0.94→0.85，衰减更快）
+            const vec3 LIGHT = normalize(vec3(1.0, 1.5, 0.8));
+            const float WATER_REFRACT = 1.0 / 1.3333; 
+            const float ATTENUATION = 0.85; // 关键调整1：衰减加快，海底更暗
+            const float SCATTER_COEF = 0.05; // 关键调整2：散射增强，水色更浓
+
+            // 向量归一化（加保护）
+            vec3 normalizeVec3(vec3 p) {
+                float len = length(p);
+                return len > 0.0001 ? p / len : vec3(0.0, 1.0, 0.0);
+            }
+
+            // 2D 噪声函数
+            float n2d(vec2 p) {
+                vec2 i = floor(p); 
+                p -= i;
+                p *= p*(3.0 - p*2.0);
+                return dot(
+                    mat2(fract(sin(mod(vec4(0.0, 1.0, 113.0, 114.0) + dot(i, vec2(1.0, 113.0)), 6.2831853))*43758.5453))
+                    * vec2(1.0 - p.y, p.y), 
+                    vec2(1.0 - p.x, p.x)
+                );
+            }
+
+            // FBM分形噪声
+            float fbm(vec2 p) {  
+                float a = 0.5;  
+                float h = 0.0;  
+                for (int i=0;i<6;i++) {  
+                    h += a*n2d(p);  
+                    a *= 0.5;  
+                    p *= 2.0;  
+                }  
+                return h;  
+            }  
+            
+            // ground函数重载
+            float ground(vec2 p) {  
+                return (fbm(p*0.002) - 0.5) * 800.0 - 50.0;  
+            }
+            float ground(vec3 p) {  
+                return ground(p.xz); 
+            }
+
+            // 水面高度函数
+            float water(vec2 p) {  
+                float w = n2d(p*0.01) * 3.0;    
+                w += n2d(p*0.05) * 0.5;         
+                return w;  
+            }  
+                
+            // 水面法线计算
+            vec3 calcWaterNormal(in vec3 pos, float eps) {  
+                vec2 e = vec2(eps, 0.0);  
+                float dx = water(pos.xz - e.xy) - water(pos.xz + e.xy);
+                float dz = water(pos.xz - e.yx) - water(pos.xz + e.yx);
+                return normalize(vec3(dx, 2.0 * eps, dz));  
+            }
+
+            // 地形法线计算
+            vec3 calcNormal(vec3 p, float eps) {
+                float dx = ground(vec3(p.x-eps, p.y, p.z)) - ground(vec3(p.x+eps, p.y, p.z));
+                float dz = ground(vec3(p.x, p.y, p.z-eps)) - ground(vec3(p.x, p.y, p.z+eps));
+                return normalizeVec3(vec3(dx, 2.0*eps, dz));
+            }
+
+            // 光线方向旋转
+            vec3 rotateRD(vec3 ro, vec3 ta, vec3 rd) {
+                vec3 cw = normalizeVec3(ta - ro);
+                vec3 cp = vec3(0.0, 1.0, 0.0);
+                vec3 cu = normalizeVec3(cross(cp, cw));
+                vec3 cv = normalizeVec3(cross(cw, cu));
+                return vec3(
+                    cu.x*rd.x + cv.x*rd.y + cw.x*rd.z,
+                    cu.y*rd.x + cv.y*rd.y + cw.y*rd.z,
+                    cu.z*rd.x + cv.z*rd.y + cw.z*rd.z
+                );
+            }
+
+            // 软阴影函数
+            float softShadow(in vec3 ro, float dis) {
+                float start = clamp(dis*0.01, 0.1, 150.0);
+                float res = 1.0;
+                for( int i=0; i<15; i++ ) { 
+                    float t = start * pow(2.0, float(i));
+                    if(t > 1000.0) break;
+                    vec3 pos = ro + t * LIGHT;
+                    float h = pos.y - ground(pos); 
+                    res = min( res, 16.0 * h / t );
+                    if( res < 0.001 || pos.y > 2000.0 ) break;
+                }
+                return clamp( res, 0.0, 1.0 );
+            }
+
+            // 陆地绘制函数
+            vec3 drawMountain(vec3 pos, vec3 rd, vec3 lgt, float resT) {
+                vec3 col = vec3(0.18,0.12,0.10) * 0.85; 
+                vec3 nor = calcNormal( pos, 0.0005 * resT );
+
+                float dif = clamp(dot( nor, lgt ), 0.0, 1.0);
+                float ssh = softShadow(pos, resT);
+                dif *= ssh; 
+                float bac = clamp(dot(normalize(vec3(-lgt.x,0.0,-lgt.z)),nor),0.0,1.0);
+                vec3 lin = 5.5 * vec3(1.0,0.9,0.8) * dif; 
+                lin += 0.7 * vec3(1.1,1.0,0.9) * bac;      
+                col *= lin;
+
+                vec3  ref = reflect(rd, nor);
+                float fre = clamp(1.0 + dot(nor, rd), 0.0, 1.0);
+                float spc = clamp(dot(ref, lgt), 0.0, 1.0);
+                float spe = 3.0 * pow(spc, 5.0) * (0.05 + 0.95 * pow(fre, 5.0));
+                col += spe * vec3(2.0) * ssh;
+                return col;
+            }
+
+            // 天空绘制函数
+            vec3 drawSky(vec3 rd) {
+                vec3 c = mix(vec3(0.6, 0.7, 0.9), vec3(0.35, 0.62, 0.82), pow(max(rd.y + 0.15, 0.0), 0.5));
+                c += pow(max(dot(rd, LIGHT) + 0.0005, 0.0), 1000.0);
+                return c;
+            }
+
+            // 光线步进函数
+            float raymarch(vec3 ro, vec3 rd, out int hitType) {  
+                hitType = -1;
+                for (int i=0; i<8000; i++) { 
+                    float t = 2.0 + float(i) * 1.0;
+                    if(t > 8000.0) break;
+                    vec3 pos = ro + t * rd;  
+                    float d = 0.002 * t;
+                
+                    float w = water(pos.xz);
+                    if (pos.y - w < d) {  
+                        hitType = 0;  
+                        return t;  
+                    }  
+                
+                    float y = ground(pos);  
+                    if (pos.y - y <= d) {  
+                        hitType = 1;  
+                        return t;  
+                    }  
+                }
+                return 8000.0;
+            }
+
+            // ===================== 调整后的drawSea函数 =====================
+            vec3 drawSea(vec3 pos, vec3 rd, float resT) {
+                // 调整水的基础颜色：更深的蓝绿色
+                vec3 seaColor = vec3(0.05, 0.2, 0.4) * 2.0; // 关键调整3：水色加深+强度翻倍
+                float eps = pow(resT*0.05, 2.7)*0.0005;
+                vec3 normal = calcWaterNormal(pos, eps);
+                
+                // 折射计算
+                vec3 ret = refract( rd, normal, WATER_REFRACT );
+                float rT = 0.01;
+                vec3 pis = vec3(0.0);
+                float a = 0.0;
+                
+                // 水下步进
+                for(int i=0; i<10000; i++) { 
+                    if(rT > 1000.0) break;
+                    pis = pos + rT * ret;
+                    a = pis.y - ground(pis.xz);
+                    if (a <= 0.01*(resT + rT)) break;
+                    float step = 0.01 + max(a*0.5, (resT + rT)*0.01);
+                    rT += step;
+                }
+                
+                // 水下散射+衰减
+                vec3 lightRet = -refract(-LIGHT, normal, WATER_REFRACT);
+                float m = (1.0 - ret.y / lightRet.y);
+                float k = log(ATTENUATION) * m;
+                
+                if(abs(k) > 0.0001) {
+                    seaColor *= SCATTER_COEF / k * (exp(rT*k) - 1.0);
+                }
+                
+                // 海底颜色叠加（衰减更快，更暗）
+                if (rT < 1000.0) {
+                    vec3 col = drawMountain(pis, ret, lightRet, resT + rT);
+                    seaColor += col * pow(ATTENUATION, rT*m * 2.0); // 关键调整4：衰减再翻倍
+                }
+                seaColor *= 0.98 - 0.98 * pow(1.0 - max(dot(LIGHT, normal), 0.0), 5.0);
+
+                // 反射计算
+                vec3 ref = normalize(reflect(rd, normal));
+                vec3 fCol = vec3(0.0);
+                int refType = -1;
+                float refResT = raymarch(pos, ref, refType);
+                
+                if (refResT < 10000.0) {
+                    vec3 refPos = pos + refResT * ref;
+                    fCol = drawMountain(refPos, ref, LIGHT, refResT + resT);
+                } else {
+                    fCol = drawSky(ref);
+                }
+
+                // 关键调整5：提高菲涅尔基础反射率（从0.02→0.2），反射占比大幅提升
+                float fresnel = 0.2 + 0.8 * pow(1.0 - max(dot(-rd, normal), 0.0), 3.0);
+                return mix(seaColor, fCol, fresnel);
+            }
+
+            void main() {
+                float x = v_uv.x * u_resolution.x;
+                float y = v_uv.y * u_resolution.y;
+
+                vec3 ro = vec3(0.0, 1200.0, u_cameraDist); 
+                vec3 ta = vec3(
+                    3000.0 * sin(u_angle.x),    
+                    300.0 + 2000.0 * sin(u_angle.y), 
+                    3000.0 * cos(u_angle.x)     
+                );
+
+                float nl = u_resolution.y / 2.0;
+                vec2 xy = vec2((x - u_resolution.x/2.0)/nl, (y - u_resolution.y/2.0)/nl);
+                vec3 rd = normalizeVec3(vec3(xy.x, xy.y, 1.0));
+                rd = rotateRD(ro, ta, rd);
+
+                int hitType;
+                float t = raymarch(ro, rd, hitType);
+                
+                vec3 col = drawSky(rd); 
+
+                if (hitType != -1) {
+                    vec3 pos = ro + t * rd; 
+                    if (hitType == 1) { 
+                        col = drawMountain(pos, rd, LIGHT, t);
+                    } else if (hitType == 0) { 
+                        col = drawSea(pos, rd, t);
+                    }
+                }
+
+                gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+            }
+        `;
+        // ===================== 片元着色器结束 =====================
+
+        // 编译函数
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(`【着色器编译错误】: ${gl.getShaderInfoLog(shader)}`);
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vShader, fShader) {
+            const program = gl.createProgram();
+            gl.attachShader(program, vShader);
+            gl.attachShader(program, fShader);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error(`【程序链接错误】: ${gl.getProgramInfoLog(program)}`);
+                gl.deleteProgram(program);
+                return null;
+            }
+            return program;
+        }
+
+        const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+        const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+        if(!vertexShader || !fragmentShader) {
+            alert("着色器编译失败，请查看控制台日志");
+        }
+        const program = createProgram(gl, vertexShader, fragmentShader);
+        if(!program) {
+            alert("程序链接失败，请查看控制台日志");
+        }
+
+        // 顶点数据
+        const positions = new Float32Array([
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+             1.0,  1.0
+        ]);
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        // 渲染初始化
+        gl.useProgram(program);
+        const a_position = gl.getAttribLocation(program, 'a_position');
+        gl.enableVertexAttribArray(a_position);
+        gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+        // Uniform变量
+        const u_resolution = gl.getUniformLocation(program, 'u_resolution');
+        const u_angle = gl.getUniformLocation(program, 'u_angle');
+        const u_cameraDist = gl.getUniformLocation(program, 'u_cameraDist');
+        gl.uniform2f(u_resolution, canvas.width, canvas.height);
+
+        // 交互参数
+        let angleX = 0.0, angleY = 0.0;
+        let cameraDist = -800.0;
+        const MIN_DIST = -200.0, MAX_DIST = -2000.0;
+        const SCALE_SPEED = 30.0, SENSITIVITY = 0.002;
+        let isDragging = false;
+        let startX, startY, startAngleX, startAngleY;
+
+        // 重绘函数
+        function draw() {
+            if(!program) return;
+            gl.uniform2f(u_angle, angleX, angleY);
+            gl.uniform1f(u_cameraDist, cameraDist);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+        // 鼠标拖拽
+        canvas.addEventListener("mousedown", e => {
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            startAngleX = angleX;
+            startAngleY = angleY;
+        });
+        canvas.addEventListener("mousemove", e => {
+            if (!isDragging) return;
+            angleX = startAngleX + (e.clientX - startX) * SENSITIVITY;
+            angleY = startAngleY - (e.clientY - startY) * SENSITIVITY;
+            draw();
+        });
+        window.addEventListener("mouseup", () => isDragging = false);
+        window.addEventListener("mouseleave", () => isDragging = false);
+
+        // 滚轮缩放
+        canvas.addEventListener("wheel", e => {
+            e.preventDefault();
+            cameraDist += e.deltaY * 0.1 * SCALE_SPEED;
+            cameraDist = Math.max(MAX_DIST, Math.min(MIN_DIST, cameraDist));
+            draw();
+        });
+
+        // 初始绘制
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        draw();
+    </script>
+</body>
+</html>

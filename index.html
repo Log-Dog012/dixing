@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL Raymarch 地形（水面降低+山体露出）</title>
+    <style>
+        body { margin: 0; cursor: grab; }
+        canvas { display: block; }
+        body:active { cursor: grabbing; }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas" width="1280" height="720" style="width:1280px;height:720px;"></canvas>
+
+    <script>
+        const canvas = document.getElementById('glCanvas');
+        const gl = canvas.getContext('webgl');
+        if (!gl) {
+            alert('你的浏览器不支持WebGL，请更换浏览器重试');
+            throw new Error('WebGL not supported');
+        }
+
+        let glContextValid = true;
+        canvas.addEventListener('webglcontextlost', (e) => {
+            e.preventDefault();
+            glContextValid = false;
+            console.warn('WebGL上下文丢失，即将重启渲染');
+        });
+        canvas.addEventListener('webglcontextrestored', () => {
+            glContextValid = true;
+            initRender();
+            console.log('WebGL上下文已恢复');
+        });
+
+        const vertexShaderSource = `
+            attribute vec2 a_position;
+            varying vec2 v_uv;
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+                v_uv = (a_position + 1.0) / 2.0;
+            }
+        `;
+
+        const fragmentShaderSource = `
+            precision mediump float;
+            varying vec2 v_uv;
+            uniform vec2 u_resolution;
+            uniform vec2 u_angle;          
+            uniform float u_cameraDist;    
+
+            const vec3 LIGHT = normalize(vec3(1.0, 1.5, 0.8));
+            const float WATER_REFRACT = 1.0 / 1.3333; 
+            const float ATTENUATION = 0.88;
+            const float SCATTER_COEF = 0.03;
+
+            vec3 normalizeVec3(vec3 p) {
+                float len = length(p);
+                return len > 0.0001 ? p / len : vec3(0.0, 1.0, 0.0);
+            }
+
+            float n2d(vec2 p) {
+                vec2 i = floor(p); 
+                p -= i;
+                p = p*p*(3.0-2.0*p);
+                return fract(sin(dot(i, vec2(127.1, 311.7)))*43758.5453)*p.x*(1.0-p.y) + 
+                       fract(sin(dot(i, vec2(269.5, 183.3)))*43758.5453)*(1.0-p.x)*p.y;
+            }
+
+            float fbm(vec2 p) {  
+                float a = 0.5;  
+                float h = 0.0;  
+                for (int i=0;i<6;i++) {
+                    h += a*n2d(p);  
+                    a *= 0.5;  
+                    p *= 2.0;  
+                }  
+                return h;  
+            }  
+            
+            // ===================== 调整1：抬高地形整体高度 =====================
+            float ground(vec2 p) {  
+                // 原参数：(fbm(p*0.002)-0.5)*800 -50 → 抬高后：*1000 + 100
+                return (fbm(p*0.002) - 0.5) * 1000.0 + 100.0;  
+            }
+            float ground(vec3 p) {  
+                return ground(p.xz); 
+            }
+
+            // ===================== 调整2：降低水面基础高度 =====================
+            float water(vec2 p) {  
+                // 原参数：n2d(p*0.01)*3.0 + n2d(p*0.05)*0.5 → 降低后：*1.0 + *0.2
+                float w = n2d(p*0.01) * 1.0;    
+                w += n2d(p*0.05) * 0.2;         
+                return w;  
+            }  
+                
+            vec3 calcWaterNormal(in vec3 pos, float eps) {  
+                vec2 e = vec2(eps, 0.0);  
+                float dx = water(pos.xz - e.xy) - water(pos.xz + e.xy);
+                float dz = water(pos.xz - e.yx) - water(pos.xz + e.yx);
+                return normalize(vec3(dx, 2.0 * eps, dz));  
+            }
+
+            vec3 calcNormal(vec3 p, float eps) {
+                float dx = ground(vec3(p.x-eps, p.y, p.z)) - ground(vec3(p.x+eps, p.y, p.z));
+                float dz = ground(vec3(p.x, p.y, p.z-eps)) - ground(vec3(p.x, p.y, p.z+eps));
+                return normalizeVec3(vec3(dx, 2.0*eps, dz));
+            }
+
+            vec3 rotateRD(vec3 ro, vec3 ta, vec3 rd) {
+                vec3 cw = normalizeVec3(ta - ro);
+                vec3 cp = vec3(0.0, 1.0, 0.0);
+                vec3 cu = normalizeVec3(cross(cp, cw));
+                vec3 cv = normalizeVec3(cross(cw, cu));
+                return vec3(
+                    cu.x*rd.x + cv.x*rd.y + cw.x*rd.z,
+                    cu.y*rd.x + cv.y*rd.y + cw.y*rd.z,
+                    cu.z*rd.x + cv.z*rd.y + cw.z*rd.z
+                );
+            }
+
+            float softShadow(in vec3 ro, float dis) {
+                float start = clamp(dis*0.01, 0.1, 150.0);
+                float res = 1.0;
+                for( int i=0; i<8; i++ ) {
+                    float t = start * pow(2.0, float(i));
+                    if(t > 800.0) break;
+                    vec3 pos = ro + t * LIGHT;
+                    float h = pos.y - ground(pos); 
+                    res = min( res, 16.0 * h / t );
+                    if( res < 0.001 || pos.y > 2000.0 ) break;
+                }
+                return clamp( res, 0.0, 1.0 );
+            }
+
+            vec3 drawMountain(vec3 pos, vec3 rd, vec3 lgt, float resT) {
+                vec3 col = vec3(0.18,0.12,0.10) * 0.85; 
+                vec3 nor = calcNormal( pos, 0.0005 * resT );
+
+                float dif = clamp(dot( nor, lgt ), 0.0, 1.0);
+                float ssh = softShadow(pos, resT);
+                dif *= ssh; 
+                float bac = clamp(dot(normalize(vec3(-lgt.x,0.0,-lgt.z)),nor),0.0,1.0);
+                vec3 lin = 4.0 * vec3(1.0,0.9,0.8) * dif;
+                lin += 0.7 * vec3(1.1,1.0,0.9) * bac;      
+                col *= lin;
+
+                vec3  ref = reflect(rd, nor);
+                float spc = clamp(dot(ref, lgt), 0.0, 1.0);
+                float spe = 2.0 * pow(spc, 3.0);
+                col += spe * vec3(1.8) * ssh;
+                return col;
+            }
+
+            vec3 drawSky(vec3 rd) {
+                vec3 c = mix(vec3(0.6, 0.7, 0.9), vec3(0.35, 0.62, 0.82), pow(max(rd.y + 0.15, 0.0), 0.5));
+                c += pow(max(dot(rd, LIGHT) + 0.0005, 0.0), 500.0);
+                return c;
+            }
+
+            float raymarch(vec3 ro, vec3 rd, out int hitType) {  
+                hitType = -1;
+                for (int i=0; i<2000; i++) {
+                    float t = 2.0 + float(i) * 2.0;
+                    if(t > 8000.0) break;
+                    vec3 pos = ro + t * rd;  
+                    float d = 0.002 * t;
+                
+                    float w = water(pos.xz);
+                    if (pos.y - w < d) {  
+                        hitType = 0;  
+                        return t;  
+                    }  
+                
+                    float y = ground(pos);  
+                    if (pos.y - y <= d) {  
+                        hitType = 1;  
+                        return t;  
+                    }  
+                }
+                return 8000.0;
+            }
+
+            vec3 drawSea(vec3 pos, vec3 rd, float resT) {
+                vec3 seaColor = vec3(0.05, 0.2, 0.4) * 1.8;
+                float eps = pow(resT*0.05, 2.7)*0.0005;
+                vec3 normal = calcWaterNormal(pos, eps);
+                
+                vec3 ret = refract( rd, normal, WATER_REFRACT );
+                float rT = 0.01;
+                vec3 pis = vec3(0.0);
+                float a = 0.0;
+                
+                for(int i=0; i<1000; i++) {
+                    if(rT > 800.0) break;
+                    pis = pos + rT * ret;
+                    a = pis.y - ground(pis.xz);
+                    if (a <= 0.01*(resT + rT)) break;
+                    float step = 0.02 + max(a*0.5, (resT + rT)*0.01);
+                    rT += step;
+                }
+                
+                vec3 lightRet = -refract(-LIGHT, normal, WATER_REFRACT);
+                float m = (1.0 - ret.y / lightRet.y);
+                float k = log(ATTENUATION) * m;
+                
+                if(abs(k) > 0.0001) {
+                    seaColor *= SCATTER_COEF / k * (exp(rT*k) - 1.0);
+                }
+                
+                if (rT < 800.0) {
+                    vec3 col = drawMountain(pis, ret, lightRet, resT + rT);
+                    seaColor += col * pow(ATTENUATION, rT*m * 2.0);
+                }
+                seaColor *= 0.98 - 0.98 * pow(1.0 - max(dot(LIGHT, normal), 0.0), 5.0);
+
+                vec3 ref = normalize(reflect(rd, normal));
+                vec3 fCol = drawSky(ref);
+                float fresnel = 0.2 + 0.8 * pow(1.0 - max(dot(-rd, normal), 0.0), 3.0);
+                return mix(seaColor, fCol, fresnel);
+            }
+
+            void main() {
+                float x = v_uv.x * u_resolution.x;
+                float y = v_uv.y * u_resolution.y;
+
+                vec3 ro = vec3(0.0, 1200.0, u_cameraDist); 
+                vec3 ta = vec3(
+                    3000.0 * sin(u_angle.x),    
+                    300.0 + 2000.0 * sin(u_angle.y), 
+                    3000.0 * cos(u_angle.x)     
+                );
+
+                float nl = u_resolution.y / 2.0;
+                vec2 xy = vec2((x - u_resolution.x/2.0)/nl, (y - u_resolution.y/2.0)/nl);
+                vec3 rd = normalizeVec3(vec3(xy.x, xy.y, 1.0));
+                rd = rotateRD(ro, ta, rd);
+
+                int hitType;
+                float t = raymarch(ro, rd, hitType);
+                
+                vec3 col = drawSky(rd); 
+
+                if (hitType != -1) {
+                    vec3 pos = ro + t * rd; 
+                    if (hitType == 1) { 
+                        col = drawMountain(pos, rd, LIGHT, t);
+                    } else if (hitType == 0) { 
+                        col = drawSea(pos, rd, t);
+                    }
+                }
+
+                gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+            }
+        `;
+
+        function createShader(gl, type, source) {
+            if(!glContextValid) return null;
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(`【着色器编译错误】: ${gl.getShaderInfoLog(shader)}`);
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vShader, fShader) {
+            if(!glContextValid) return null;
+            const program = gl.createProgram();
+            gl.attachShader(program, vShader);
+            gl.attachShader(program, fShader);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error(`【程序链接错误】: ${gl.getShaderInfoLog(program)}`);
+                gl.deleteProgram(program);
+                return null;
+            }
+            return program;
+        }
+
+        let program = null;
+        let a_position = -1;
+        let u_resolution = -1;
+        let u_angle = -1;
+        let u_cameraDist = -1;
+
+        function initRender() {
+            const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+            const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+            if(!vertexShader || !fragmentShader) {
+                alert("着色器编译失败，请查看控制台日志");
+                return;
+            }
+            program = createProgram(gl, vertexShader, fragmentShader);
+            if(!program) {
+                alert("程序链接失败，请查看控制台日志");
+                return;
+            }
+
+            const positions = new Float32Array([
+                -1.0, -1.0,
+                 1.0, -1.0,
+                -1.0,  1.0,
+                 1.0,  1.0
+            ]);
+            const buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+            gl.useProgram(program);
+            a_position = gl.getAttribLocation(program, 'a_position');
+            gl.enableVertexAttribArray(a_position);
+            gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+            u_resolution = gl.getUniformLocation(program, 'u_resolution');
+            u_angle = gl.getUniformLocation(program, 'u_angle');
+            u_cameraDist = gl.getUniformLocation(program, 'u_cameraDist');
+            gl.uniform2f(u_resolution, canvas.width, canvas.height);
+
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            draw();
+        }
+
+        let angleX = 0.0, angleY = 0.0;
+        let cameraDist = -800.0;
+        const MIN_DIST = -200.0, MAX_DIST = -2000.0;
+        const SCALE_SPEED = 30.0, SENSITIVITY = 0.002;
+        let isDragging = false;
+        let startX, startY, startAngleX, startAngleY;
+
+        let isDrawing = false;
+        function draw() {
+            if(!glContextValid || !program || isDrawing) return;
+            isDrawing = true;
+            requestAnimationFrame(() => {
+                gl.uniform2f(u_angle, angleX, angleY);
+                gl.uniform1f(u_cameraDist, cameraDist);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                isDrawing = false;
+            });
+        }
+
+        canvas.addEventListener("mousedown", e => {
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            startAngleX = angleX;
+            startAngleY = angleY;
+        });
+        canvas.addEventListener("mousemove", e => {
+            if (!isDragging || !glContextValid) return;
+            angleX = startAngleX - (e.clientX - startX) * SENSITIVITY;
+            angleY = startAngleY + (e.clientY - startY) * SENSITIVITY;
+            draw();
+        });
+        window.addEventListener("mouseup", () => isDragging = false);
+        window.addEventListener("mouseleave", () => isDragging = false);
+
+        canvas.addEventListener("wheel", e => {
+            e.preventDefault();
+            if(!glContextValid) return;
+            cameraDist += e.deltaY * 0.1 * SCALE_SPEED;
+            cameraDist = Math.max(MAX_DIST, Math.min(MIN_DIST, cameraDist));
+            draw();
+        });
+
+        initRender();
+    </script>
+</body>
+</html>

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL Raymarch 地形（核显流畅版）</title>
+    <style>
+        body { margin: 0; cursor: grab; }
+        canvas { display: block; }
+        body:active { cursor: grabbing; }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas" width="800" height="450" style="width:800px;height:450px;"></canvas>
+
+    <script>
+        const canvas = document.getElementById('glCanvas');
+        const gl = canvas.getContext('webgl');
+        if (!gl) {
+            alert('你的浏览器不支持WebGL，请更换浏览器重试');
+            throw new Error('WebGL not supported');
+        }
+
+        // 顶点着色器（极简）
+        const vertexShaderSource = `
+            attribute vec2 a_position;
+            varying vec2 v_uv;
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+                v_uv = (a_position + 1.0) / 2.0;
+            }
+        `;
+
+        // ===================== 片元着色器（轻量化优化）=====================
+        const fragmentShaderSource = `
+            precision mediump float; // 降精度！核显救星（从highp改为mediump）
+            varying vec2 v_uv;
+            uniform vec2 u_resolution;
+            uniform vec2 u_angle;
+            uniform float u_cameraDist;
+
+            // 简化噪声：去掉复杂的mod/sin，用低成本哈希噪声
+            float hash(vec2 p) {
+                return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+            }
+
+            // 简化FBM：仅2层，大幅减少计算
+            float fbm(vec2 p) {  
+                float h = 0.0;
+                float a = 0.5;
+                for(int i=0; i<2; i++){ // 从6层砍到2层
+                    h += a * hash(p);
+                    a *= 0.5;
+                    p *= 2.0;
+                }
+                return h;
+            }
+
+            // 地形高度：简化公式，降低计算量
+            float ground(vec3 p) {
+                return (fbm(p.xz*0.003) - 0.5) * 500.0 - 50.0;
+            }
+
+            // 水面高度：去掉多层噪声，仅保留基础波动
+            float water(vec2 p) {
+                return hash(p*0.02) * 2.0;
+            }
+
+            // 法线计算：增大eps，减少精度消耗
+            vec3 calcNormal(vec3 p, int type) {
+                float eps = 0.5; // 从0.05增大到0.5，减少计算
+                vec2 e = vec2(eps, 0.0);
+                float y0 = type==1 ? ground(p) : water(p.xz);
+                float y1 = type==1 ? ground(p+vec3(e.x,0,0)) : water((p+vec3(e.x,0,0)).xz);
+                float y2 = type==1 ? ground(p+vec3(0,0,e.x)) : water((p+vec3(0,0,e.x)).xz);
+                return normalize(vec3(y0-y1, eps*2.0, y0-y2));
+            }
+
+            // 光线方向旋转：简化计算
+            vec3 rotateRD(vec3 ro, vec3 ta, vec3 rd) {
+                vec3 cw = normalize(ta - ro);
+                vec3 cu = normalize(cross(vec3(0,1,0), cw));
+                vec3 cv = cross(cw, cu);
+                return mat3(cu, cv, cw) * rd;
+            }
+
+            // 光线步进：砍迭代次数+增大步长
+            float raymarch(vec3 ro, vec3 rd, out int hitType) {
+                hitType = -1;
+                for(float t=5.0; t<3000.0; t+=5.0) { // 步长从1.0增大到5.0
+                    vec3 pos = ro + rd * t;
+                    float w = water(pos.xz);
+                    if(pos.y - w < 0.5) { hitType=0; return t; }
+                    float g = ground(pos);
+                    if(pos.y - g < 0.5) { hitType=1; return t; }
+                }
+                return 3000.0;
+            }
+
+            void main() {
+                // 简化坐标计算
+                vec2 xy = (v_uv - 0.5) * 2.0;
+                xy.x *= u_resolution.x / u_resolution.y; // 适配宽高比
+
+                // 相机参数：简化，减少sin/cos计算
+                vec3 ro = vec3(0.0, 800.0, u_cameraDist);
+                vec3 ta = vec3(2000.0*sin(u_angle.x), 200.0, 2000.0*cos(u_angle.x));
+                vec3 rd = normalize(vec3(xy, 1.0));
+                rd = rotateRD(ro, ta, rd);
+
+                // 光线步进（轻量化）
+                int hitType;
+                float t = raymarch(ro, rd, hitType);
+
+                // 你的天空渐变（保留，无修改）
+                vec3 col = mix(vec3(0.6,0.7,0.9), vec3(0.35,0.62,0.82), pow(max(rd.y+0.15,0.0),0.5));
+
+                // 简化碰撞颜色计算
+                if(hitType != -1) {
+                    vec3 pos = ro + rd * t;
+                    vec3 nor = calcNormal(pos, hitType);
+                    vec3 light = normalize(vec3(1,1,0));
+                    float diff = max(dot(nor, light), 0.2);
+                    col = hitType==1 ? vec3(0.6,0.7,0.4)*diff : vec3(0.1,0.5,0.7)*diff;
+                }
+
+                gl_FragColor = vec4(col, 1.0);
+            }
+        `;
+        // ===================== 片元着色器结束 =====================
+
+        // 编译函数（保留错误日志）
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if(!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(shader));
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, v, f) {
+            const p = gl.createProgram();
+            gl.attachShader(p, v);
+            gl.attachShader(p, f);
+            gl.linkProgram(p);
+            if(!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+                console.error(gl.getProgramInfoLog(p));
+                return null;
+            }
+            return p;
+        }
+
+        const vs = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+        const fs = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+        const program = createProgram(gl, vs, fs);
+        gl.useProgram(program);
+
+        // 顶点数据（极简）
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+        const a_pos = gl.getAttribLocation(program, 'a_position');
+        gl.enableVertexAttribArray(a_pos);
+        gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 0, 0);
+
+        // Uniform变量
+        gl.uniform2f(gl.getUniformLocation(program, 'u_resolution'), canvas.width, canvas.height);
+        gl.uniform2f(gl.getUniformLocation(program, 'u_angle'), 0, 0);
+        gl.uniform1f(gl.getUniformLocation(program, 'u_cameraDist'), -800);
+
+        // 交互逻辑（简化，减少计算）
+        let isDrag = false, startX, startY, angleX=0, angleY=0, camDist=-800;
+        canvas.onmousedown = e => { isDrag=true; startX=e.clientX; startY=e.clientY; };
+        canvas.onmousemove = e => {
+            if(!isDrag) return;
+            angleX += (e.clientX - startX) * 0.002;
+            angleY -= (e.clientY - startY) * 0.002;
+            startX = e.clientX; startY = e.clientY;
+            draw();
+        };
+        window.onmouseup = () => isDrag = false;
+        canvas.onwheel = e => {
+            e.preventDefault();
+            camDist += e.deltaY * 2;
+            camDist = Math.max(-2000, Math.min(-200, camDist));
+            draw();
+        };
+
+        // 重绘函数（极简）
+        function draw() {
+            gl.uniform2f(gl.getUniformLocation(program, 'u_angle'), angleX, angleY);
+            gl.uniform1f(gl.getUniformLocation(program, 'u_cameraDist'), camDist);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+        gl.clearColor(0,0,0,1);
+        draw();
+    </script>
+</body>
+</html>

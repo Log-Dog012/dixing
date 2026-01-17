@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL 全屏红色矩形（正交相机）</title>
+    <style>
+        /* 移除边距，让画布全屏显示 */
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas"></canvas>
+
+    <script>
+        // 1. 获取画布并设置为全屏尺寸
+        const canvas = document.getElementById('glCanvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        // 2. 获取WebGL上下文
+        const gl = canvas.getContext('webgl');
+        if (!gl) {
+            alert('你的浏览器不支持WebGL，请更换浏览器重试');
+            throw new Error('WebGL not supported');
+        }
+
+        // 3. 定义着色器源码
+        // 顶点着色器：处理顶点坐标，结合正交矩阵映射到屏幕
+        const vertexShaderSource = `
+            attribute vec2 a_position; // 顶点位置属性
+            
+            uniform mat4 u_projectionMatrix; // 正交投影矩阵
+            
+            void main() {
+                // 将二维顶点坐标转换为齐次坐标，并应用投影矩阵
+                gl_Position = u_projectionMatrix * vec4(a_position, 0.0, 1.0);
+            }
+        `;
+
+        // ===================== 片元着色器（重点标注）=====================
+        // 片元着色器：控制每个像素的颜色，你后续可以修改这里的颜色逻辑
+        const fragmentShaderSource = `
+            precision mediump float; // 设置浮点精度
+            
+            void main() {
+                // 设置片元颜色为红色 (RGBA: 红=1, 绿=0, 蓝=0, 不透明度=1)
+                gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);
+            }
+        `;
+        // ===================== 片元着色器结束 =====================
+
+        // 4. 编译着色器并创建程序
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            // 检查编译错误
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                alert(`着色器编译失败: ${gl.getShaderInfoLog(shader)}`);
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vertexShader, fragmentShader) {
+            const program = gl.createProgram();
+            gl.attachShader(program, vertexShader);
+            gl.attachShader(program, fragmentShader);
+            gl.linkProgram(program);
+            // 检查链接错误
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                alert(`程序链接失败: ${gl.getProgramInfoLog(program)}`);
+                gl.deleteProgram(program);
+                return null;
+            }
+            return program;
+        }
+
+        // 编译顶点和片元着色器
+        const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+        const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+        const program = createProgram(gl, vertexShader, fragmentShader);
+
+        // 5. 定义全屏矩形的顶点数据（正交相机下，-1到1覆盖整个屏幕）
+        // 矩形由两个三角形组成，共6个顶点（三角带方式也可以，这里用最简单的方式）
+        const positions = new Float32Array([
+            -1.0, -1.0, // 左下角
+             1.0, -1.0, // 右下角
+            -1.0,  1.0, // 左上角
+            -1.0,  1.0, // 左上角
+             1.0, -1.0, // 右下角
+             1.0,  1.0  // 右上角
+        ]);
+
+        // 6. 创建并绑定顶点缓冲区
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        // 7. 计算正交投影矩阵（正交相机核心）
+        // 正交矩阵参数：left, right, bottom, top, near, far
+        function createOrthographicMatrix(left, right, bottom, top, near, far) {
+            return [
+                2/(right-left), 0, 0, 0,
+                0, 2/(top-bottom), 0, 0,
+                0, 0, -2/(far-near), 0,
+                -(right+left)/(right-left), -(top+bottom)/(top-bottom), -(far+near)/(far-near), 1
+            ];
+        }
+        // 正交矩阵覆盖整个屏幕（left=-1, right=1, bottom=-1, top=1 对应WebGL的标准化设备坐标）
+        const projectionMatrix = createOrthographicMatrix(-1, 1, -1, 1, -1, 1);
+
+        // 8. 绘制准备
+        gl.useProgram(program); // 使用着色器程序
+
+        // 获取属性和统一变量的位置
+        const a_position = gl.getAttribLocation(program, 'a_position');
+        const u_projectionMatrix = gl.getUniformLocation(program, 'u_projectionMatrix');
+
+        // 设置统一变量：传递正交投影矩阵
+        gl.uniformMatrix4fv(u_projectionMatrix, false, projectionMatrix);
+
+        // 启用顶点属性并设置格式
+        gl.enableVertexAttribArray(a_position);
+        gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+        // 9. 清除画布并绘制
+        gl.clearColor(0.0, 0.0, 0.0, 1.0); // 清除颜色设为黑色
+        gl.clear(gl.COLOR_BUFFER_BIT);    // 清除颜色缓冲区
+        gl.drawArrays(gl.TRIANGLES, 0, 6); // 绘制6个顶点（两个三角形组成矩形）
+
+        // 10. 监听窗口大小变化，重新调整画布尺寸并重绘
+        window.addEventListener('resize', () => {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, canvas.width, canvas.height); // 更新视口
+            gl.drawArrays(gl.TRIANGLES, 0, 6); // 重新绘制
+        });
+    </script>
+</body>
+</html>
